@@ -4,6 +4,10 @@
     loom-discord run                         the poller (the piece's service): shadow or live, by DISCORD_MODE
     loom-discord send --place P --agent A    the venue's `send` (the runtime runs it): the text on stdin, posted as
                                              that agent's own bot; answers {ok, id?} or {ok: false, reason}
+        … --describe                         the place's rules, for a body's start: {ok, guest, peer, venue,
+                                             readers, notes, pair?} (posts nothing; shadow too)
+        … --status working|done [--message ID]...   a body at work there (the runtime's word): the run loop shows
+                                             it (typing, 👀); answers {ok, stop?} (stop: a person said the stop word)
     loom-discord compare --start T --adapter GLOB --bridge GLOB [--hours 24] [--json]
                                              the shadow window: this adapter's log against the old bridge's
     loom-discord status [--json]             the mode, the agents, the log's size (no ids, no text)
@@ -26,6 +30,7 @@ from loomdiscord import adapter, routing  # noqa: E402
 PIECE = "discord"
 VENUE = "discord"
 MAX_POST = 2000
+TYPING_EVERY_S = 8
 
 
 def config(env=None):
@@ -114,7 +119,15 @@ def run(cfg):
         n = a.tick()
         if n:
             common.log(f"{'would deliver' if cfg['mode'] == 'shadow' else 'delivered'} {n}")
-        time.sleep(max(1.0, cfg["poll_s"] - (time.time() - started)))
+        # Between polls, live: what the runtime says of its bodies at work, shown (Discord's typing lasts ~10 s).
+        end = started + max(1.0, cfg["poll_s"])
+        while time.time() < end:
+            if cfg["mode"] == "live":
+                try:
+                    a.show()
+                except Exception as e:  # noqa: BLE001 - presence never stops the poller
+                    common.log(f"presence: {type(e).__name__}")
+            time.sleep(max(0.5, min(TYPING_EVERY_S, end - time.time())))
 
 
 def chunks(text, n=MAX_POST):
@@ -140,6 +153,13 @@ def send(cfg, argv, stdin=None, secrets=None, api_for=None):
         agent = argv[argv.index("--agent") + 1]
     except (ValueError, IndexError):
         return answer({"ok": False, "reason": "usage: loom-discord send --place <place> --agent <agent>"})
+    if "--describe" in argv:
+        return answer(describe(cfg, agent, place))
+    if "--status" in argv:
+        i = argv.index("--status")
+        state = argv[i + 1] if i + 1 < len(argv) else ""
+        msgs = [argv[j + 1] for j, x in enumerate(argv) if x == "--message" and j + 1 < len(argv)]
+        return answer(common.Presence(cfg["data"]).status(agent, place, state, msgs))
     if cfg["mode"] != "live":
         return answer({"ok": False, "reason": "loom-discord is in shadow mode: it posts nothing"})
     kind, _, cid = place.partition(":")
@@ -163,7 +183,25 @@ def send(cfg, argv, stdin=None, secrets=None, api_for=None):
             first = first or got.get("id")
     except Exception as e:  # noqa: BLE001 - the runtime gets a reason, never a trace
         return answer({"ok": False, "reason": f"Discord refused the post: {type(e).__name__} {getattr(e, 'code', '')}".strip()})
+    common.Presence(cfg["data"]).posted(agent, place)   # the reply is the acknowledgment: 👀 comes off
     return answer({"ok": True, **({"id": str(first)} if first else {})})
+
+
+def describe(cfg, agent, place, docs=None):
+    """The place's rules, from the agent's route map and gates (the same reads routing uses: either unreadable is
+    {ok: false}, so the runtime starts no body there) and the poller's memory of which channel a thread is under."""
+    if agent not in cfg["bots"]:
+        return {"ok": False, "reason": f"no Discord bot for {agent}"}
+    r, g = docs or (common.Doc(common.fill(cfg["routes"], agent=agent), what=f"{agent}'s route map"),
+                    common.Doc(common.fill(cfg["gates"], agent=agent), what=f"{agent}'s gates"))
+    routes, gates = r.doc(), g.doc()
+    if routes is None or gates is None:
+        return {"ok": False, "reason": f"{agent}'s route map or gates can't be read"}
+    parents = (common.load_json(Path(cfg["data"]) / "state.json", {}) or {}).get("parents") or {}
+    chan = routing.chan_of(place, parents)
+    if chan is None:
+        return {"ok": False, "reason": f"not a Discord place this adapter knows: {place[:80]}"}
+    return routing.View(agent, routes, gates).describe(chan)
 
 
 def status(cfg, as_json):

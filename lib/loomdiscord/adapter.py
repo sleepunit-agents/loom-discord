@@ -20,6 +20,7 @@ API = "https://discord.com/api/v10"
 THREAD_FIRST_SIGHT_S = 3600     # a thread this young on first sight is read from its start
 HANDLED_KEEP_S = 2 * 86400      # how long a handled (message, agent) is remembered
 GUEST_DAILY_DEFAULT = 30        # a guest's deliveries a day, unless their entry says (daily_spawns)
+ACK_EMOJI = "\U0001F440"       # 👀: a body took this message (shuttle's presence, 2026-09-16)
 
 
 class RateLimited(Exception):
@@ -56,18 +57,49 @@ class Discord:
         return self.call(f"/channels/{channel_id}/messages", "POST", {"content": content,
                                                                        "allowed_mentions": {"parse": ["users"]}})
 
+    def react(self, channel_id, msg_id, add=True):
+        emoji = urllib.parse.quote(ACK_EMOJI)
+        return self.call(f"/channels/{channel_id}/messages/{msg_id}/reactions/{emoji}/@me", "PUT" if add else "DELETE")
+
+    def typing(self, channel_id):
+        return self.call(f"/channels/{channel_id}/typing", "POST")
+
+
+def react(api, place, msg_id, add):
+    """👀 on (or off) a message in a place: True when done, or when there's nothing left to do (it's gone)."""
+    cid = str(place).partition(":")[2]
+    if not (cid.isdigit() and str(msg_id).isdigit()):
+        return True
+    try:
+        api.react(cid, msg_id, add)
+        return True
+    except urllib.error.HTTPError as e:
+        return e.code in (403, 404)
+    except (RateLimited, urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def typing(api, place):
+    cid = str(place).partition(":")[2]
+    if cid.isdigit():
+        try:
+            api.typing(cid)
+        except (RateLimited, urllib.error.URLError, OSError, ValueError):
+            pass
+
 
 class Adapter:
     """The poll loop's state and one tick. `apis` maps agent to its Discord client; `views` gives an agent's
     routing.View (its routes and gates, freshly read); `sink(agent, msg, chan, hit, label)` delivers, or None in
     shadow; `shadow` is the ShadowLog."""
 
-    def __init__(self, data_dir, apis, views, shadow, sink=None, now=time.time):
+    def __init__(self, data_dir, apis, views, shadow, sink=None, now=time.time, presence=None):
         self.data_dir = Path(data_dir)
         self.state_file = self.data_dir / "state.json"
         self.apis, self.views, self.shadow, self.sink, self.now = apis, views, shadow, sink, now
+        self.presence = presence or common.Presence(self.data_dir, now=now)
         self.state = common.load_json(self.state_file, {})
-        for k in ("cursors", "handled", "guest_count"):
+        for k in ("cursors", "handled", "guest_count", "parents", "peer_stopped", "acked"):
             self.state.setdefault(k, {})
 
     def save(self):
@@ -88,7 +120,31 @@ class Adapter:
         for t in data.get("threads", []):
             if t.get("type") in (11, 12) and view.polled(t.get("parent_id")):
                 out.append({"id": t["id"], "name": t.get("name", "?"), "parent_id": t.get("parent_id"), "is_thread": True})
+                # Which channel a thread is under, for `send --describe` (a thread goes by its parent).
+                self.state["parents"][str(t["id"])] = str(t.get("parent_id"))
         return out
+
+    # -------------------------------------------------------------- the stop word, and presence
+
+    def stopped(self, agent, view, msg, chan, place):
+        """A person said the stop word here: the runtime hears it (its next presence call answers stop) and ends this
+        agent's body; in a peer venue, peer turns wait until a person says something else (shuttle's t-591). Live,
+        one line says so."""
+        self.presence.stop(agent, place, msg["id"])
+        if view.entry(chan).get("peer"):
+            self.state["peer_stopped"].setdefault(agent, {})[place] = True
+        common.log(f"{agent}: the stop word in {place}")
+        if self.sink is not None:
+            try:
+                peer = " I won't take peer turns here until a person says something that isn't stop." if view.entry(chan).get("peer") else ""
+                self.apis[agent].post(chan["id"], f"Stopped here.{peer}")
+            except Exception as e:  # noqa: BLE001 - best effort
+                common.log(f"{agent}: couldn't say it stopped in {place}: {type(e).__name__}")
+
+    def show(self):
+        """Live: 👀 on what each working body took, typing while it owes a reply (common.Presence.show)."""
+        self.presence.show(self.state["acked"], self.apis, react, typing)
+        self.save()
 
     def handled(self, msg_id, agent):
         return agent in self.state["handled"].get(str(msg_id), {}).get("agents", [])
@@ -150,10 +206,20 @@ class Adapter:
             msgs.sort(key=lambda m: int(m["id"]))
             stop_at = None
             for m in msgs:
+                place = routing.place_of(ch)
+                if not self.handled(m["id"], agent) and view.is_stop(m, ch) and (
+                        view.entry(ch).get("peer") or self.presence.working(agent, place)):
+                    self.stopped(agent, view, m, ch, place)
+                    self.note_handled(m["id"], agent)
+                    continue
+                if view.human_here(m, ch):
+                    self.state["peer_stopped"].get(agent, {}).pop(place, None)   # a person's word lifts a stop
                 why = view.reason(m, ch)
                 if not why or self.handled(m["id"], agent):
                     continue
-                place = routing.place_of(ch)
+                if why == "peer" and self.state["peer_stopped"].get(agent, {}).get(place):
+                    self.note_handled(m["id"], agent)
+                    continue
                 if self.sink is None:
                     self.shadow.routed(m["id"], agent, place)
                     self.note_handled(m["id"], agent)
