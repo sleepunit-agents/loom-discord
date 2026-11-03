@@ -64,9 +64,12 @@ same agents and places on both sides, and there must be at least 20. Exit 0 agre
 ## Send
 
 `loom-discord send --place <place> --agent <agent>`, the text on stdin: posted as that agent's bot, split under
-Discord's 2000 characters, answering `{ok, id?}` or `{ok: false, reason}` (no bot for that agent, a secret the policy
-doesn't allow, shadow mode). Run by anything but loom's piece dispatch (the runtime runs it by its bin name), it
-goes through `loom discord send …` so the piece's own settings apply.
+Discord's 2000 characters, answering `{ok, id?}` or `{ok: false, reason, permanent?}`. `permanent: true` is a refusal
+no retry will change, which the runtime records as refused and doesn't retry or keep for a body: shadow mode, no bot
+for that agent, not a Discord place, nothing to send, settings that don't parse, and a post Discord answers with a
+4xx (an unknown channel, a missing permission, a bad token). A rate limit, a timeout, a 5xx, the network, and a
+secret the policy doesn't allow (yet) say no `permanent`. Run by anything but loom's piece dispatch (the runtime runs
+it by its bin name), it goes through `loom discord send …` so the piece's own settings apply.
 
 ## Bot tokens
 

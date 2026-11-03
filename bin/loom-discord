@@ -3,7 +3,8 @@
 
     loom-discord run                         the poller (the piece's service): shadow or live, by DISCORD_MODE
     loom-discord send --place P --agent A    the venue's `send` (the runtime runs it): the text on stdin, posted as
-                                             that agent's own bot; answers {ok, id?} or {ok: false, reason}
+                                             that agent's own bot; answers {ok, id?} or {ok: false, reason,
+                                             permanent?} (permanent: no retry will ever post it)
         … --describe                         the place's rules, for a body's start: {ok, guest, peer, venue,
                                              readers, notes, pair?} (posts nothing; shadow too)
         … --status working|done [--message ID]...   a body at work there (the runtime's word): the run loop shows
@@ -19,6 +20,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 from pathlib import Path
 
 HERE = Path(os.path.realpath(__file__)).parent
@@ -143,16 +145,28 @@ def chunks(text, n=MAX_POST):
     return out
 
 
+def refused_for_good(e):
+    """A post Discord refused that no retry will change: a 4xx (an unknown channel, a missing permission, a bad
+    token, a body Discord won't take). A rate limit, a timeout, a 5xx or the network is for now."""
+    return isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code not in (408, 429)
+
+
 def send(cfg, argv, stdin=None, secrets=None, api_for=None):
-    """{ok, id?} | {ok: false, reason}: the text on stdin, posted to the place as the agent's own bot."""
+    """{ok, id?} | {ok: false, reason, permanent?}: the text on stdin, posted to the place as the agent's own bot.
+    `permanent: true` is a refusal for good (agent-runtime.md, "Outbound"): the runtime doesn't retry it or keep it
+    for a body, it records it refused. A refusal that may pass later (a rate limit, Discord down, a secret the
+    owner hasn't allowed yet) says no `permanent`."""
     def answer(d):
         print(json.dumps(d))
         return 0 if d.get("ok") else 1
+
+    def never(reason):
+        return answer({"ok": False, "reason": reason, "permanent": True})
     try:
         place = argv[argv.index("--place") + 1]
         agent = argv[argv.index("--agent") + 1]
     except (ValueError, IndexError):
-        return answer({"ok": False, "reason": "usage: loom-discord send --place <place> --agent <agent>"})
+        return never("usage: loom-discord send --place <place> --agent <agent>")
     if "--describe" in argv:
         return answer(describe(cfg, agent, place))
     if "--status" in argv:
@@ -161,20 +175,20 @@ def send(cfg, argv, stdin=None, secrets=None, api_for=None):
         msgs = [argv[j + 1] for j, x in enumerate(argv) if x == "--message" and j + 1 < len(argv)]
         return answer(common.Presence(cfg["data"]).status(agent, place, state, msgs))
     if cfg["mode"] != "live":
-        return answer({"ok": False, "reason": "loom-discord is in shadow mode: it posts nothing"})
+        return never("loom-discord is in shadow mode: it posts nothing")
     kind, _, cid = place.partition(":")
     if kind not in ("channel", "thread") or not cid.isdigit():
-        return answer({"ok": False, "reason": f"not a Discord place: {place[:80]}"})
+        return never(f"not a Discord place: {place[:80]}")
     name = cfg["bots"].get(agent)
     if not name:
-        return answer({"ok": False, "reason": f"no Discord bot for {agent}"})
+        return never(f"no Discord bot for {agent}")
     try:
         token = (secrets or common.Secrets(cfg["may"], cfg["get"])).get(agent, name)
     except common.SecretRefused as e:
         return answer({"ok": False, "reason": f"{agent}'s bot: {e}"})
     text = (stdin if stdin is not None else sys.stdin).read()
     if not text.strip():
-        return answer({"ok": False, "reason": "nothing to send"})
+        return never("nothing to send")
     api = (api_for or adapter.Discord)(token)
     first = None
     try:
@@ -182,7 +196,8 @@ def send(cfg, argv, stdin=None, secrets=None, api_for=None):
             got = api.post(cid, part) or {}
             first = first or got.get("id")
     except Exception as e:  # noqa: BLE001 - the runtime gets a reason, never a trace
-        return answer({"ok": False, "reason": f"Discord refused the post: {type(e).__name__} {getattr(e, 'code', '')}".strip()})
+        reason = f"Discord refused the post: {type(e).__name__} {getattr(e, 'code', '')}".strip()
+        return never(reason) if refused_for_good(e) else answer({"ok": False, "reason": reason})
     common.Presence(cfg["data"]).posted(agent, place)   # the reply is the acknowledgment: 👀 comes off
     return answer({"ok": True, **({"id": str(first)} if first else {})})
 
@@ -224,8 +239,8 @@ def main(argv):
     try:
         cfg = config()
     except SystemExit as e:
-        if verb == "send":
-            print(json.dumps({"ok": False, "reason": str(e)}))
+        if verb == "send":   # its settings don't parse: no retry fixes that
+            print(json.dumps({"ok": False, "reason": str(e), "permanent": True}))
             return 1
         raise
     if verb == "run":
