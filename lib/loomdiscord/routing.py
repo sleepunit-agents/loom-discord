@@ -110,6 +110,66 @@ class View:
         """The gates' entry for a message's author, or None."""
         return self.who.get(str((msg.get("author") or {}).get("id")))
 
+    def is_stop(self, msg, chan):
+        """A person's message that's only the stop word (mentions aside), from someone the gates let wake this
+        agent here: it stops this agent's work in the place, and isn't a summons (shuttle's t-591)."""
+        author = msg.get("author") or {}
+        if author.get("bot") or msg.get("webhook_id") is not None or msg.get("type") not in (0, 19):
+            return False
+        if not self.human_allowed(author.get("id"), venue_of(chan)):
+            return False
+        return common.is_stop_text(ANY_MENTION.sub("", msg.get("content", "")))
+
+    def human_here(self, msg, chan):
+        """A person (not a bot or webhook) whom the gates let wake this agent in this place."""
+        author = msg.get("author") or {}
+        return (not author.get("bot") and msg.get("webhook_id") is None and msg.get("type") in (0, 19)
+                and self.human_allowed(author.get("id"), venue_of(chan)))
+
+    def describe(self, chan):
+        """What the runtime asks of a place before a body starts there (loom-box policy.mjs): whether it's a guest
+        venue (the route map's `guest_venue`, or a guest's own venue in the gates: the guest reads every reply there),
+        its readers (the route map's `readers`, and those guests), whether it's a peer venue, and the notes it
+        carries: the route map's other keys that list its channel. A thread goes by its parent channel."""
+        entry = self.entry(chan)
+        venue = venue_of(chan)
+        guests = sorted({slug for _, (slug, rec) in self.who.items()
+                         if not rec["agent"] and rec.get("tier") == 1 and str(venue) in [str(v) for v in rec.get("venues") or []]})
+        readers = [s for s in (entry.get("readers") or []) if isinstance(s, str)]
+        readers += [s for s in guests if s not in readers]
+        notes = sorted(k for k, v in self.routes.items()
+                       if isinstance(k, str) and not k.startswith("_") and k not in CORE_KEYS and lists(v, venue))
+        peer = bool(entry.get("peer"))
+        return {"ok": True, "guest": bool(entry.get("guest_venue")) or bool(guests), "peer": peer, "venue": str(venue),
+                "readers": readers, "notes": notes, **({"pair": str(entry["pair"])} if peer and entry.get("pair") else {})}
+
+
+# The route map's own keys: anything else that lists a channel is a note on it (`describe`).
+CORE_KEYS = {"guild", "bots", "bot_roles", "channels", "threads", "webhook_peers", "peer_turns_each", "guests",
+             "ignore", "only", "notify"}
+
+
+def lists(v, cid):
+    """Whether a route map value names channel `cid`: it is it, holds it, or maps it."""
+    cid = str(cid)
+    if isinstance(v, (str, int)) and not isinstance(v, bool):
+        return str(v) == cid
+    if isinstance(v, list):
+        return cid in [str(x) for x in v]
+    if isinstance(v, dict):
+        return cid in [str(k) for k in v]
+    return False
+
+
+def chan_of(place, parents):
+    """A place as a channel for `View.entry`: a thread's parent from the poller's memory, or None when unknown."""
+    kind, _, cid = str(place).partition(":")
+    if kind == "channel" and cid.isdigit():
+        return {"id": cid}
+    if kind == "thread" and cid.isdigit() and str(parents.get(cid) or "").isdigit():
+        return {"id": cid, "is_thread": True, "parent_id": str(parents[cid])}
+    return None
+
 
 def venue_of(chan):
     """What a guest's `venues` name: a thread goes by its parent channel."""

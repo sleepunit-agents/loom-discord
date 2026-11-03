@@ -86,11 +86,39 @@ value stays in the process, never in argv, a log or a file.
 | `DISCORD_LOOM_URL` | loom's address (`http://127.0.0.1:8787`) |
 | `DISCORD_ROUTES_COMMAND`, `DISCORD_GATES_COMMAND` | JSON argvs printing `{"doc": …}`, `{agent}` filled in |
 
+## What the runtime asks of a place
+
+Before a body starts, the runtime runs the declared send argv with `--describe` (it posts nothing, in shadow too):
+
+```json
+{"ok": true, "guest": false, "peer": true, "venue": "<channel id>", "readers": [], "notes": ["<route map key>"], "pair": "<name>"}
+```
+
+- **A guest venue** is one the route map marks `guest_venue`, or one a guest (a tier-1 gate entry) has in its `venues`,
+  because the guest reads every reply there. Its `readers` are the route map's `readers` and those guests. The
+  runtime then gives the body the agent's guest floor, the readers' cards and the narrowed tools, or no body.
+- **A thread** goes by its parent channel, as the poller last saw it. A thread it never saw isn't described (`ok:
+  false`), so no body starts there.
+- **`notes`** are the route map's other keys that list the channel, such as a set of channels with rules of their own.
+  The agent's policy maps a note's name to its brief file.
+- Unreadable gates or routes answer `ok: false`.
+
+## A body at work, and the stop word
+
+The runtime runs `--status working --message <delivery id>` when a message reaches a body, again every 15 s while it
+works, and `--status done` when its turn is over. That call only writes the piece's data dir; the poller, live, shows
+it between polls every 8 s: 👀 on each message the body took, and typing while it owes a reply. 👀 comes off once the
+agent's `send` posts there after it (the reply is the acknowledgment) or the body is done.
+
+**The stop word:** a message that's only "stop" or "cancel" (its mentions aside), from a person the gates let wake the
+agent there, stops the agent's body in that place when one is working there or it's a peer venue. It isn't delivered.
+The runtime hears it on its next `--status` (`{ok: true, stop: true}`) and ends the body; live, one line says so. In a
+peer venue, peer turns then wait until a person says something else.
+
 ## Not here (yet)
 
-Bridge features that are about bodies, not routing, and are the runtime's now or later: the human "stop" word in a
-peer venue, the peer-turn budget, a guest venue's readers' cards, typing and the 👀 reaction, the channel notes and
-the extension tick (the packages channel). `render` isn't declared: loom's generic render shows these conversations.
+The peer-turn budget, and the extension tick (the packages channel). `render` isn't declared: loom's generic render
+shows these conversations.
 
 ## Tests
 
