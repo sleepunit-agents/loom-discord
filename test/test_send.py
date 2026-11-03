@@ -6,8 +6,11 @@ import importlib.util
 import io
 import json
 import unittest
+import unittest.mock
+import urllib.error
 from pathlib import Path
 
+from loomdiscord import adapter
 from loomvenue import common
 
 BIN = Path(__file__).resolve().parent.parent / "bin" / "loom-discord"
@@ -75,7 +78,7 @@ class Send(unittest.TestCase):
 
     def test_no_bot_for_the_agent_or_a_refused_secret_says_why(self):
         _, ans = run_send(self.cfg, ["--place", "channel:30", "--agent", "bolt"], "x")
-        self.assertEqual(ans, {"ok": False, "reason": "no Discord bot for bolt"})
+        self.assertEqual(ans, {"ok": False, "reason": "no Discord bot for bolt", "permanent": True})
         _, ans = run_send(self.cfg, ["--place", "channel:30", "--agent", "kit"], "x", FakeSecrets(ok=False))
         self.assertFalse(ans["ok"])
         self.assertNotIn("t0ken", json.dumps(ans))
@@ -86,6 +89,77 @@ class Send(unittest.TestCase):
         _, ans = run_send(self.cfg, ["--agent", "kit"], "x")
         self.assertIn("usage", ans["reason"])
         self.assertEqual(FakeApi.posts, [])
+
+
+class FailingApi:
+    """Discord answering every post with one failure."""
+    def __init__(self, error):
+        self.error = error
+
+    def __call__(self, token):
+        return self
+
+    def post(self, cid, text):
+        raise self.error
+
+
+def http(code):
+    return urllib.error.HTTPError("https://discord.com/api/v10/channels/30/messages", code, "x", {}, None)
+
+
+class Permanent(unittest.TestCase):
+    """`permanent: true` when no retry will ever post it (agent-runtime.md, "Outbound"): the runtime records it
+    refused, doesn't retry it and keeps nothing for a body. A refusal for now says no `permanent`."""
+
+    def setUp(self):
+        FakeApi.posts = []
+        self.cfg = cli.config({"DISCORD_MODE": "live", "DISCORD_BOTS": '{"kit": "kit-discord-token"}'})
+
+    def ans(self, argv, text="x", cfg=None, secrets=None, api=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.send(cfg or self.cfg, argv, stdin=io.StringIO(text), secrets=secrets or FakeSecrets(),
+                            api_for=api or FakeApi)
+        self.assertEqual(code, 1)
+        return json.loads(out.getvalue())
+
+    def test_shadow_no_bot_a_place_that_isnt_discords_and_nothing_to_send_are_for_good(self):
+        shadow = cli.config({"DISCORD_BOTS": '{"kit": "kit-discord-token"}'})
+        for argv, text, cfg in ((["--place", "channel:30", "--agent", "kit"], "x", shadow),
+                                (["--place", "channel:30", "--agent", "bolt"], "x", None),
+                                (["--place", "dm:U1", "--agent", "kit"], "x", None),
+                                (["--place", "channel:abc", "--agent", "kit"], "x", None),
+                                (["--agent", "kit"], "x", None),
+                                (["--place", "channel:30", "--agent", "kit"], "  \n", None)):
+            with self.subTest(argv=argv, shadow=cfg is shadow):
+                a = self.ans(argv, text, cfg)
+                self.assertIs(a["permanent"], True)
+                self.assertFalse(a["ok"])
+        self.assertEqual(FakeApi.posts, [])
+
+    def test_a_channel_discord_wont_let_it_post_in_is_for_good(self):
+        for code in (400, 401, 403, 404):
+            with self.subTest(code=code):
+                a = self.ans(["--place", "channel:30", "--agent", "kit"], api=FailingApi(http(code)))
+                self.assertEqual(a, {"ok": False, "reason": f"Discord refused the post: HTTPError {code}",
+                                     "permanent": True})
+
+    def test_a_rate_limit_a_5xx_the_network_or_an_unallowed_secret_is_for_now(self):
+        for err in (adapter.RateLimited(5), http(408), http(500), http(502),
+                    urllib.error.URLError("down"), TimeoutError(), ValueError("not JSON")):
+            with self.subTest(err=repr(err)):
+                a = self.ans(["--place", "channel:30", "--agent", "kit"], api=FailingApi(err))
+                self.assertNotIn("permanent", a)
+        a = self.ans(["--place", "channel:30", "--agent", "kit"], secrets=FakeSecrets(ok=False))
+        self.assertNotIn("permanent", a)
+
+    def test_settings_that_dont_parse_are_for_good(self):
+        out = io.StringIO()
+        env = {"LOOM_PIECE_NAME": "discord", "DISCORD_BOTS": "not json"}
+        with unittest.mock.patch.dict("os.environ", env, clear=True), contextlib.redirect_stdout(out):
+            code = cli.main(["send", "--place", "channel:30", "--agent", "kit"])
+        self.assertEqual(code, 1)
+        self.assertIs(json.loads(out.getvalue())["permanent"], True)
 
 
 class Secrets(unittest.TestCase):
