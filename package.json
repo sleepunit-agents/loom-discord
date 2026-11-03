@@ -1,0 +1,79 @@
+{
+  "name": "loom-discord",
+  "version": "0.1.0",
+  "private": true,
+  "description": "loom's Discord venue adapter: each agent's own bot, its messages routed to the agent and handed to loom's deliver, and the agent's replies posted as that bot",
+  "bin": {
+    "loom-discord": "bin/loom-discord"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "python3 -m unittest discover -s test -t ."
+  },
+  "license": "AGPL-3.0-or-later",
+  "loom": {
+    "name": "discord",
+    "role": "venue",
+    "label": "Discord",
+    "description": "Discord as a venue: each agent's own bot; a message is routed (a mention, the channel's primary, the gates) and delivered to the agent, and its replies post as that bot.",
+    "settings": [
+      {
+        "name": "DISCORD_MODE",
+        "label": "Mode",
+        "kind": "choice",
+        "options": [
+          { "value": "shadow", "label": "Shadow: route and log, deliver nothing, post nothing" },
+          { "value": "live", "label": "Live: deliver to loom, post replies" }
+        ],
+        "default": "shadow"
+      },
+      {
+        "name": "DISCORD_BOTS",
+        "label": "Each agent's bot",
+        "hint": "JSON: agent to the secret its bot token comes from, like {\"kit\": \"kit-discord-token\"}; the secrets piece's policy must allow that agent",
+        "required": true
+      },
+      {
+        "name": "DISCORD_DATA",
+        "label": "Where its cursors and logs are kept",
+        "default": "${LOOM_PIECE_HOME}/data"
+      },
+      {
+        "name": "DISCORD_POLL_S",
+        "label": "Seconds between polls",
+        "default": "30"
+      },
+      {
+        "name": "DISCORD_TOKEN_FILE",
+        "label": "This piece's own token, to deliver with (live)",
+        "hint": "a file holding a piece token of this piece's (loom token create --piece discord/<name>)"
+      },
+      {
+        "name": "DISCORD_LOOM_URL",
+        "label": "loom's address, as this machine reaches it",
+        "default": "http://127.0.0.1:8787"
+      },
+      {
+        "name": "DISCORD_ROUTES_COMMAND",
+        "label": "How an agent's route map is read",
+        "hint": "a JSON argv printing {\"doc\": …}, {agent} filled in; default [\"loom\", \"shuttle\", \"routes\", \"--agent\", \"{agent}\", \"--json\"]"
+      },
+      {
+        "name": "DISCORD_GATES_COMMAND",
+        "label": "How an agent's gates are read",
+        "hint": "a JSON argv printing {\"doc\": …}, {agent} filled in; default the runtime's [\"loom\", \"runtime\", \"gates\", \"people\", \"--agent\", \"{agent}\", \"--json\"]"
+      }
+    ],
+    "venues": {
+      "discord": { "label": "Discord", "kind": "live", "send": ["loom-discord", "send"] }
+    },
+    "services": [
+      { "name": "run", "argv": ["loom-discord", "run"] }
+    ]
+  }
+}

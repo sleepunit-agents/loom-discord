@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""loom-discord: loom's Discord venue adapter (loom docs/specs/agent-runtime.md, "The sources").
+
+    loom-discord run                         the poller (the piece's service): shadow or live, by DISCORD_MODE
+    loom-discord send --place P --agent A    the venue's `send` (the runtime runs it): the text on stdin, posted as
+                                             that agent's own bot; answers {ok, id?} or {ok: false, reason}
+    loom-discord compare --start T --adapter GLOB --bridge GLOB [--hours 24] [--json]
+                                             the shadow window: this adapter's log against the old bridge's
+    loom-discord status [--json]             the mode, the agents, the log's size (no ids, no text)
+
+Shadow (the default): it receives and routes, records nothing and posts nothing, and logs (message id, agent,
+place) for each message it would deliver. Live: each routed message goes to loom's `deliver`, and `send` posts.
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(HERE.parent / "lib"))
+
+from loomvenue import common  # noqa: E402
+from loomdiscord import adapter, routing  # noqa: E402
+
+PIECE = "discord"
+VENUE = "discord"
+MAX_POST = 2000
+
+
+def config(env=None):
+    env = os.environ if env is None else env
+    home = env.get("LOOM_PIECE_HOME") or str(Path.home() / ".local/state/loom-discord")
+    return {
+        "mode": common.mode_setting(env, "DISCORD_MODE"),
+        "bots": common.bots_setting(env, "DISCORD_BOTS"),
+        "data": common.setting(env, "DISCORD_DATA", str(Path(home) / "data")),
+        "poll_s": float(common.setting(env, "DISCORD_POLL_S", "30")),
+        "routes": common.argv_setting(env, "DISCORD_ROUTES_COMMAND",
+                                      ["loom", "shuttle", "routes", "--agent", "{agent}", "--json"]),
+        "gates": common.argv_setting(env, "DISCORD_GATES_COMMAND",
+                                     ["loom", "runtime", "gates", "people", "--agent", "{agent}", "--json"]),
+        "may": common.argv_setting(env, "DISCORD_SECRETS_MAY", ["loom", "secrets", "may", "{agent}", "{name}", "--json"]),
+        "get": common.argv_setting(env, "DISCORD_SECRETS_GET", ["loom", "secrets", "get", "{name}", "--reveal"]),
+        "loom_url": common.setting(env, "DISCORD_LOOM_URL", "http://127.0.0.1:8787"),
+        "token_file": common.setting(env, "DISCORD_TOKEN_FILE"),
+    }
+
+
+def under_loom(env=None):
+    """Whether loom runs this as the discord piece (its settings are in the environment)."""
+    return (os.environ if env is None else env).get("LOOM_PIECE_NAME") == PIECE
+
+
+def reexec_under_loom(argv):
+    """Run by something other than loom's piece dispatch (the runtime runs a venue's `send` by its bin name):
+    go through `loom discord …`, so the piece's own settings apply."""
+    loom = os.environ.get("LOOM_BIN") or "loom"
+    os.execvp(loom, [loom, PIECE, *argv])
+
+
+def make_views(cfg, docs):
+    def views(agent):
+        r, g = docs[agent]
+        routes, gates = r.doc(), g.doc()
+        if routes is None or gates is None:
+            return None
+        return routing.View(agent, routes, gates)
+    return views
+
+
+def make_sink(cfg):
+    deliverer = common.Deliverer(cfg["loom_url"], cfg["token_file"])
+
+    def sink(agent, msg, chan, hit, label):
+        body = common.delivery(msg["id"], agent, VENUE, routing.place_of(chan), label, common.from_of(hit),
+                               msg.get("timestamp") or adapter.snowflake_iso(msg["id"]), routing.text_of(msg))
+        status, ans = deliverer.deliver(body)
+        if status == 200:
+            common.log(f"{agent}: delivered {msg['id']} to {ans.get('conversation')} seq {ans.get('seq')}: {ans.get('body')}")
+            return True
+        if status in (400, 403, 409, 413):
+            # Refused for good (loom keeps no answer for it): retrying the same body can only be refused again.
+            common.log(f"{agent}: deliver {msg['id']} REFUSED {status}: {str(ans.get('error'))[:200]}; not retried")
+            return True
+        common.log(f"{agent}: deliver {msg['id']}: {status or 'no answer'} {str(ans.get('error'))[:200]}; next tick")
+        return False
+    return sink
+
+
+def run(cfg):
+    secrets = common.Secrets(cfg["may"], cfg["get"])
+    apis, docs = {}, {}
+    for agent, name in sorted(cfg["bots"].items()):
+        try:
+            apis[agent] = adapter.Discord(secrets.get(agent, name))
+        except common.SecretRefused as e:
+            common.log(f"{agent}: no bot: {e}")
+            continue
+        docs[agent] = (common.Doc(common.fill(cfg["routes"], agent=agent), what=f"{agent}'s route map"),
+                       common.Doc(common.fill(cfg["gates"], agent=agent), what=f"{agent}'s gates"))
+    if not apis:
+        common.log("no agent's bot could be read; nothing to poll")
+        return 1
+    if cfg["mode"] == "live" and not cfg["token_file"]:
+        common.log("live mode needs DISCORD_TOKEN_FILE (a piece token of this piece's, to deliver with)")
+        return 1
+    shadow = common.ShadowLog(cfg["data"], "discord")
+    a = adapter.Adapter(cfg["data"], apis, make_views(cfg, docs), shadow,
+                        sink=None if cfg["mode"] == "shadow" else make_sink(cfg))
+    common.log(f"loom-discord: {cfg['mode']} for {', '.join(sorted(apis))}, every {cfg['poll_s']:g}s")
+    while True:
+        started = time.time()
+        n = a.tick()
+        if n:
+            common.log(f"{'would deliver' if cfg['mode'] == 'shadow' else 'delivered'} {n}")
+        time.sleep(max(1.0, cfg["poll_s"] - (time.time() - started)))
+
+
+def chunks(text, n=MAX_POST):
+    out = []
+    while text:
+        if len(text) <= n:
+            out.append(text)
+            break
+        cut = text.rfind("\n", 0, n)
+        cut = cut if cut > n // 2 else n
+        out.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return out
+
+
+def send(cfg, argv, stdin=None, secrets=None, api_for=None):
+    """{ok, id?} | {ok: false, reason}: the text on stdin, posted to the place as the agent's own bot."""
+    def answer(d):
+        print(json.dumps(d))
+        return 0 if d.get("ok") else 1
+    try:
+        place = argv[argv.index("--place") + 1]
+        agent = argv[argv.index("--agent") + 1]
+    except (ValueError, IndexError):
+        return answer({"ok": False, "reason": "usage: loom-discord send --place <place> --agent <agent>"})
+    if cfg["mode"] != "live":
+        return answer({"ok": False, "reason": "loom-discord is in shadow mode: it posts nothing"})
+    kind, _, cid = place.partition(":")
+    if kind not in ("channel", "thread") or not cid.isdigit():
+        return answer({"ok": False, "reason": f"not a Discord place: {place[:80]}"})
+    name = cfg["bots"].get(agent)
+    if not name:
+        return answer({"ok": False, "reason": f"no Discord bot for {agent}"})
+    try:
+        token = (secrets or common.Secrets(cfg["may"], cfg["get"])).get(agent, name)
+    except common.SecretRefused as e:
+        return answer({"ok": False, "reason": f"{agent}'s bot: {e}"})
+    text = (stdin if stdin is not None else sys.stdin).read()
+    if not text.strip():
+        return answer({"ok": False, "reason": "nothing to send"})
+    api = (api_for or adapter.Discord)(token)
+    first = None
+    try:
+        for part in chunks(text):
+            got = api.post(cid, part) or {}
+            first = first or got.get("id")
+    except Exception as e:  # noqa: BLE001 - the runtime gets a reason, never a trace
+        return answer({"ok": False, "reason": f"Discord refused the post: {type(e).__name__} {getattr(e, 'code', '')}".strip()})
+    return answer({"ok": True, **({"id": str(first)} if first else {})})
+
+
+def status(cfg, as_json):
+    p = Path(cfg["data"]) / common.ShadowLog.NAME
+    try:
+        n = sum(1 for _ in p.open())
+    except OSError:
+        n = 0
+    d = {"mode": cfg["mode"], "agents": sorted(cfg["bots"]), "shadow_lines": n}
+    print(json.dumps(d) if as_json else f"{d['mode']}: {', '.join(d['agents']) or 'no agents'}; {n} shadow lines")
+    return 0
+
+
+def main(argv):
+    verb = argv[0] if argv else ""
+    if verb in ("send", "run", "status") and not under_loom():
+        reexec_under_loom(argv)
+    if verb == "compare":
+        return common.compare_main(argv[1:], "discord")
+    try:
+        cfg = config()
+    except SystemExit as e:
+        if verb == "send":
+            print(json.dumps({"ok": False, "reason": str(e)}))
+            return 1
+        raise
+    if verb == "run":
+        return run(cfg)
+    if verb == "send":
+        return send(cfg, argv[1:])
+    if verb == "status":
+        return status(cfg, "--json" in argv)
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
