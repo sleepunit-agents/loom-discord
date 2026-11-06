@@ -11,7 +11,7 @@
                                              it (typing, 👀); answers {ok, stop?} (stop: a person said the stop word)
     loom-discord compare --start T --adapter GLOB --bridge GLOB [--hours 24] [--json]
                                              the shadow window: this adapter's log against the old bridge's
-    loom-discord status [--json]             the mode, the agents, the log's size (no ids, no text)
+    loom-discord status [--json]             the mode, the agents, the log's size, how many are held (no ids, no text)
 
 Shadow (the default): it receives and routes, records nothing and posts nothing, and logs (message id, agent,
 place) for each message it would deliver. Live: each routed message goes to loom's `deliver`, and `send` posts.
@@ -30,7 +30,6 @@ from loomvenue import common  # noqa: E402
 from loomdiscord import adapter, routing  # noqa: E402
 
 PIECE = "discord"
-VENUE = adapter.VENUE
 MAX_POST = 2000
 TYPING_EVERY_S = 8
 
@@ -128,9 +127,8 @@ def run(cfg):
     alerter = common.Alerter(cfg["alert"])
     a = adapter.Adapter(cfg["data"], apis, make_views(cfg, docs), shadow, alerter=alerter,
                         sink=None if cfg["mode"] == "shadow" else make_sink(cfg, alerter=alerter))
-    held = sorted(a.state["held"])
-    if held and cfg["mode"] == "live":
-        common.log(f"{len(held)} held deliveries from before this start: trying them again")
+    if a.state["held"] and cfg["mode"] == "live":
+        common.log(f"{len(a.state['held'])} held deliveries from before this start: trying them again")
     common.log(f"loom-discord: {cfg['mode']} for {', '.join(sorted(apis))}, every {cfg['poll_s']:g}s")
     while True:
         started = time.time()

@@ -101,7 +101,8 @@ def typing(api, place):
 class Adapter:
     """The poll loop's state and one tick. `apis` maps agent to its Discord client; `views` gives an agent's
     routing.View (its routes and gates, freshly read); `sink(agent, msg, chan, hit, label)` delivers, or None in
-    shadow; `shadow` is the ShadowLog."""
+    shadow: it answers True (done: delivered, or refused for good), False (next tick) or common.HOLD (held), and
+    HOLD is tested first (it's a truthy string); `shadow` is the ShadowLog."""
 
     def __init__(self, data_dir, apis, views, shadow, sink=None, now=time.time, presence=None, alerter=None):
         self.data_dir = Path(data_dir)
@@ -169,6 +170,8 @@ class Adapter:
     def prune(self):
         cut = self.now() - HANDLED_KEEP_S
         self.state["handled"] = {k: v for k, v in self.state["handled"].items() if v.get("at", 0) >= cut}
+        # A held record is for `status`; the message itself waits behind its cursor whether or not this is kept.
+        self.state["held"] = {k: v for k, v in self.state["held"].items() if v.get("at", 0) >= cut}
         day = time.strftime("%Y-%m-%d", time.gmtime(self.now()))
         self.state["guest_count"] = {k: v for k, v in self.state["guest_count"].items() if k.startswith(day)}
 
