@@ -236,12 +236,13 @@ class Adapter:
                     self.note_handled(m["id"], agent)
                     continue
                 if self.sink is None:
-                    self.shadow.routed(m["id"], agent, place, contract=self.check(agent, m, ch, view, names))
+                    self.shadow.routed(m["id"], agent, place, contract=self.contract_check(agent, m, ch, view, names))
                     self.note_handled(m["id"], agent)
                     routed += 1
                     continue
                 key = f"{agent}:{m['id']}"
                 if key in self.held_now:
+                    self.state["held"].setdefault(key, {"place": place})["at"] = self.now()   # still held
                     stop_at = m["id"]       # held: not sent again by this process
                     break
                 if self.guest_over_cap(view, m, why):
@@ -267,7 +268,7 @@ class Adapter:
                     cursors[cid] = before[-1]
         return routed
 
-    def check(self, agent, m, ch, view, names):
+    def contract_check(self, agent, m, ch, view, names):
         """Shadow: the body live would send for this message, checked against loom's deliver contract; nothing is
         sent. Answers the problems ([] when loom would take its shape); a mismatch is said once a process."""
         problems = common.contract_problems(body_of(agent, m, ch, view.sender(m), routing.label_of(ch, names)))
