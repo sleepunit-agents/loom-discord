@@ -48,11 +48,27 @@ a webhook). A thread is its own place, and is never labelled with its own name (
 starter message's text). The text goes only to `deliver`, which puts it in loom's audit log; the turn in loom is
 metadata only. This piece logs ids, counts and reasons, never text or a token.
 
+**`at`** is the message's time as loom's deliver takes it: UTC, milliseconds, `Z` (`2026-11-06T16:34:58.881Z`),
+truncated, never rounded (`common.iso`). loom refuses anything else with a 400. Lengths are capped as loom counts them
+(JavaScript's, UTF-16 units: an emoji is 2). `common.contract_problems` is a copy of loom's checks, in loom's words;
+CI checks it against loom's and loom-box's main (`test/test_deliver_contract.py`, `LoomSource`).
+
+**What loom's answer means** (`common.verdict`, from loom's `src/delivery.ts`):
+
+| Answer | The message |
+|---|---|
+| 200 | delivered |
+| 403, 409, 413 | refused for good, about this message (who may deliver it: a venue or grant; the same id with another body; over 256 KB): marked done, not retried |
+| 400, 415 | **held**: loom refused how this adapter wrote the request (a time, an id, a key, a length; malformed JSON; the content type). Every field is this adapter's to get right, so whatever loom's words, it's a bug here. Not marked done, not sent again by this process, never timed out, and tried again once the adapter restarts (an update does); the owner's alert command hears it once |
+| anything else (no answer, 401, 404, 429, 5xx) | tried again, on the next tick |
+
 ## Shadow mode
 
 `DISCORD_MODE=shadow` (the default) receives and routes, delivers nothing and posts nothing (`send` answers
 `{ok: false}`), and writes one line per message it would deliver to `<DISCORD_DATA>/shadow-routes.jsonl`:
-`{at, platform, id, agent, place}`, the same line shuttle's bridges write. Then:
+`{at, platform, id, agent, place, contract}`, the same line shuttle's bridges write, plus `contract`: the body live
+would send for it, checked against loom's deliver contract here (`common.contract_problems`, nothing sent), `"ok"`
+or what loom would refuse. A mismatch is also a journal line (`CONTRACT MISMATCH`) and one alert. Then:
 
 ```
 loom-discord compare --start 2026-11-03T00:00:00Z --adapter '<data>/shadow-routes.jsonl' --bridge '<bridge state>/shadow-routes.jsonl'
@@ -87,6 +103,7 @@ value stays in the process, never in argv, a log or a file.
 | `DISCORD_POLL_S` | seconds between polls (30) |
 | `DISCORD_TOKEN_FILE` | live: a piece token of this piece's, to deliver with (`loom token create --piece discord/<name>`) |
 | `DISCORD_LOOM_URL` | loom's address (`http://127.0.0.1:8787`) |
+| `DISCORD_ALERT_COMMAND` | the owner's alert command, a JSON argv (loom's keeping-watch.md): a held delivery, a shadow contract mismatch; unset, the journal only |
 | `DISCORD_ROUTES_COMMAND`, `DISCORD_GATES_COMMAND` | JSON argvs printing `{"doc": …}`, `{agent}` filled in |
 
 ## What the runtime asks of a place

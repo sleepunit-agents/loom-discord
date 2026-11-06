@@ -5,6 +5,14 @@ either logs it (shadow) or hands it to loom's `deliver` (live).
 One platform message is handled once per addressed agent (bridges.md, "Several bots see the same message"): a
 message two bots both see, addressed to both, is two deliveries, and a message seen twice by one bot (a cursor
 that didn't move, a restart) is one.
+
+**Held (t-1909).** A delivery loom refuses as malformed (common.verdict's HOLD: a 400 about how this adapter wrote
+it) isn't marked handled: its channel's cursor stays before it, it isn't sent again by this process, and the next
+process (an update restarts it) tries it again. A message refused for good (FINAL) is handled, as before.
+
+**The shadow's contract check.** In shadow, each message it would deliver is also built into the body live would
+send, and checked against loom's deliver contract (common.contract_problems), nothing sent: the shadow log's line
+carries `contract` ("ok", or what loom would refuse), and a mismatch is a journal line and one alert.
 """
 import json
 import time
@@ -20,6 +28,8 @@ API = "https://discord.com/api/v10"
 THREAD_FIRST_SIGHT_S = 3600     # a thread this young on first sight is read from its start
 HANDLED_KEEP_S = 2 * 86400      # how long a handled (message, agent) is remembered
 GUEST_DAILY_DEFAULT = 30        # a guest's deliveries a day, unless their entry says (daily_spawns)
+VENUE = "discord"
+SOURCE = "loom-discord"        # the alert command's source
 ACK_EMOJI = "\U0001F440"       # 👀: a body took this message (shuttle's presence, 2026-09-16)
 
 
@@ -91,15 +101,18 @@ def typing(api, place):
 class Adapter:
     """The poll loop's state and one tick. `apis` maps agent to its Discord client; `views` gives an agent's
     routing.View (its routes and gates, freshly read); `sink(agent, msg, chan, hit, label)` delivers, or None in
-    shadow; `shadow` is the ShadowLog."""
+    shadow: it answers True (done: delivered, or refused for good), False (next tick) or common.HOLD (held), and
+    HOLD is tested first (it's a truthy string); `shadow` is the ShadowLog."""
 
-    def __init__(self, data_dir, apis, views, shadow, sink=None, now=time.time, presence=None):
+    def __init__(self, data_dir, apis, views, shadow, sink=None, now=time.time, presence=None, alerter=None):
         self.data_dir = Path(data_dir)
+        self.alerter = alerter or common.Alerter()
+        self.held_now = set()       # "<agent>:<id>" held by this process: not sent again until it restarts
         self.state_file = self.data_dir / "state.json"
         self.apis, self.views, self.shadow, self.sink, self.now = apis, views, shadow, sink, now
         self.presence = presence or common.Presence(self.data_dir, now=now)
         self.state = common.load_json(self.state_file, {})
-        for k in ("cursors", "handled", "guest_count", "parents", "peer_stopped", "acked"):
+        for k in ("cursors", "handled", "guest_count", "parents", "peer_stopped", "acked", "held"):
             self.state.setdefault(k, {})
 
     def save(self):
@@ -157,6 +170,8 @@ class Adapter:
     def prune(self):
         cut = self.now() - HANDLED_KEEP_S
         self.state["handled"] = {k: v for k, v in self.state["handled"].items() if v.get("at", 0) >= cut}
+        # A held record is for `status`; the message itself waits behind its cursor whether or not this is kept.
+        self.state["held"] = {k: v for k, v in self.state["held"].items() if v.get("at", 0) >= cut}
         day = time.strftime("%Y-%m-%d", time.gmtime(self.now()))
         self.state["guest_count"] = {k: v for k, v in self.state["guest_count"].items() if k.startswith(day)}
 
@@ -221,17 +236,28 @@ class Adapter:
                     self.note_handled(m["id"], agent)
                     continue
                 if self.sink is None:
-                    self.shadow.routed(m["id"], agent, place)
+                    self.shadow.routed(m["id"], agent, place, contract=self.contract_check(agent, m, ch, view, names))
                     self.note_handled(m["id"], agent)
                     routed += 1
                     continue
+                key = f"{agent}:{m['id']}"
+                if key in self.held_now:
+                    self.state["held"].setdefault(key, {"place": place})["at"] = self.now()   # still held
+                    stop_at = m["id"]       # held: not sent again by this process
+                    break
                 if self.guest_over_cap(view, m, why):
                     self.note_handled(m["id"], agent)
                     continue
                 ok = self.sink(agent, m, ch, view.sender(m), routing.label_of(ch, names))
+                if ok == common.HOLD:
+                    self.held_now.add(key)
+                    self.state["held"][key] = {"at": self.now(), "place": place}
+                    stop_at = m["id"]
+                    break
                 if not ok:
                     stop_at = m["id"]       # loom didn't take it: from here, next tick
                     break
+                self.state["held"].pop(key, None)
                 self.note_handled(m["id"], agent)
                 routed += 1
             if stop_at is None:
@@ -241,6 +267,17 @@ class Adapter:
                 if before:
                     cursors[cid] = before[-1]
         return routed
+
+    def contract_check(self, agent, m, ch, view, names):
+        """Shadow: the body live would send for this message, checked against loom's deliver contract; nothing is
+        sent. Answers the problems ([] when loom would take its shape); a mismatch is said once a process."""
+        problems = common.contract_problems(body_of(agent, m, ch, view.sender(m), routing.label_of(ch, names)))
+        if problems:
+            common.log(f"{agent}: CONTRACT MISMATCH {m['id']}: {'; '.join(problems)[:300]}")
+            self.alerter.alert("contract", SOURCE, "bad",
+                               "loom-discord shadow: a delivery it would make doesn't match loom's deliver contract",
+                               message=m["id"], agent=agent, problems="; ".join(problems))
+        return problems
 
     def tick(self):
         self.prune()
@@ -265,6 +302,22 @@ def snowflake_age_s(sid, now):
 
 def snowflake_iso(sid):
     try:
-        return common.iso(((int(sid) >> 22) + 1420070400000) / 1000)
+        ms = (int(sid) >> 22) + 1420070400000
+        return common.iso(f"{ms // 1000}.{ms % 1000:03d}")
     except (TypeError, ValueError):
         return common.iso(time.time())
+
+
+def message_iso(msg):
+    """A message's time as loom takes it: Discord's `timestamp` (`…58.881000+00:00`) through common.iso, else its
+    snowflake's."""
+    try:
+        return common.iso(msg["timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return snowflake_iso(msg.get("id"))
+
+
+def body_of(agent, msg, chan, hit, label):
+    """The deliver body for one message to one agent: what live sends, and what the shadow checks."""
+    return common.delivery(msg["id"], agent, VENUE, routing.place_of(chan), label, common.from_of(hit),
+                           message_iso(msg), routing.text_of(msg))
