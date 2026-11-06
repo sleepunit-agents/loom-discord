@@ -59,6 +59,11 @@
         "default": "http://127.0.0.1:8787"
       },
       {
+        "name": "DISCORD_ALERT_COMMAND",
+        "label": "The owner's alert command",
+        "hint": "a JSON argv run as <argv> loom-discord --severity bad --summary … (keeping-watch.md): a delivery loom refused as malformed, or a shadow body loom wouldn't take; unset, the journal only"
+      },
+      {
         "name": "DISCORD_ROUTES_COMMAND",
         "label": "How an agent's route map is read",
         "hint": "a JSON argv printing {\"doc\": …}, {agent} filled in; default [\"loom\", \"shuttle\", \"routes\", \"--agent\", \"{agent}\", \"--json\"]"

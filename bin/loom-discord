@@ -30,7 +30,7 @@ from loomvenue import common  # noqa: E402
 from loomdiscord import adapter, routing  # noqa: E402
 
 PIECE = "discord"
-VENUE = "discord"
+VENUE = adapter.VENUE
 MAX_POST = 2000
 TYPING_EVERY_S = 8
 
@@ -51,6 +51,7 @@ def config(env=None):
         "get": common.argv_setting(env, "DISCORD_SECRETS_GET", ["loom", "secrets", "get", "{name}", "--reveal"]),
         "loom_url": common.setting(env, "DISCORD_LOOM_URL", "http://127.0.0.1:8787"),
         "token_file": common.setting(env, "DISCORD_TOKEN_FILE"),
+        "alert": common.alert_setting(env, "DISCORD_ALERT_COMMAND"),
     }
 
 
@@ -76,21 +77,32 @@ def make_views(cfg, docs):
     return views
 
 
-def make_sink(cfg):
-    deliverer = common.Deliverer(cfg["loom_url"], cfg["token_file"])
+def make_sink(cfg, deliverer=None, alerter=None):
+    """The live sink: True (loom took it, or refused it for good), False (next tick), or common.HOLD (loom refused
+    how this adapter wrote it: held and alerted, tried again once the adapter restarts; common.verdict)."""
+    deliverer = deliverer or common.Deliverer(cfg["loom_url"], cfg["token_file"])
+    alerter = alerter or common.Alerter(cfg.get("alert"))
 
     def sink(agent, msg, chan, hit, label):
-        body = common.delivery(msg["id"], agent, VENUE, routing.place_of(chan), label, common.from_of(hit),
-                               msg.get("timestamp") or adapter.snowflake_iso(msg["id"]), routing.text_of(msg))
-        status, ans = deliverer.deliver(body)
-        if status == 200:
+        status, ans = deliverer.deliver(adapter.body_of(agent, msg, chan, hit, label))
+        v = common.verdict(status, ans)
+        err = str(ans.get("error"))[:200]
+        if v == common.DONE:
             common.log(f"{agent}: delivered {msg['id']} to {ans.get('conversation')} seq {ans.get('seq')}: {ans.get('body')}")
             return True
-        if status in (400, 403, 409, 413):
-            # Refused for good (loom keeps no answer for it): retrying the same body can only be refused again.
-            common.log(f"{agent}: deliver {msg['id']} REFUSED {status}: {str(ans.get('error'))[:200]}; not retried")
+        if v == common.FINAL:
+            # Refused for good, about this message (loom keeps no answer for it): the same body is refused again.
+            common.log(f"{agent}: deliver {msg['id']} REFUSED {status}: {err}; not retried")
             return True
-        common.log(f"{agent}: deliver {msg['id']}: {status or 'no answer'} {str(ans.get('error'))[:200]}; next tick")
+        if v == common.HOLD:
+            common.log(f"{agent}: deliver {msg['id']} HELD {status}: {err}; loom refused how this adapter wrote it: "
+                       "kept, and tried again once the adapter is updated (restarted)")
+            alerter.alert("hold", adapter.SOURCE, "bad",
+                          f"loom-discord: loom refused a delivery as malformed ({status}); messages are held, "
+                          "not lost, until the adapter is fixed and restarted",
+                          status=status, error=err, message=msg["id"], agent=agent)
+            return common.HOLD
+        common.log(f"{agent}: deliver {msg['id']}: {status or 'no answer'} {err}; next tick")
         return False
     return sink
 
@@ -113,8 +125,12 @@ def run(cfg):
         common.log("live mode needs DISCORD_TOKEN_FILE (a piece token of this piece's, to deliver with)")
         return 1
     shadow = common.ShadowLog(cfg["data"], "discord")
-    a = adapter.Adapter(cfg["data"], apis, make_views(cfg, docs), shadow,
-                        sink=None if cfg["mode"] == "shadow" else make_sink(cfg))
+    alerter = common.Alerter(cfg["alert"])
+    a = adapter.Adapter(cfg["data"], apis, make_views(cfg, docs), shadow, alerter=alerter,
+                        sink=None if cfg["mode"] == "shadow" else make_sink(cfg, alerter=alerter))
+    held = sorted(a.state["held"])
+    if held and cfg["mode"] == "live":
+        common.log(f"{len(held)} held deliveries from before this start: trying them again")
     common.log(f"loom-discord: {cfg['mode']} for {', '.join(sorted(apis))}, every {cfg['poll_s']:g}s")
     while True:
         started = time.time()
@@ -225,8 +241,11 @@ def status(cfg, as_json):
         n = sum(1 for _ in p.open())
     except OSError:
         n = 0
-    d = {"mode": cfg["mode"], "agents": sorted(cfg["bots"]), "shadow_lines": n}
-    print(json.dumps(d) if as_json else f"{d['mode']}: {', '.join(d['agents']) or 'no agents'}; {n} shadow lines")
+    st = common.load_json(Path(cfg["data"]) / "state.json", {}) or {}
+    held = len(st.get("held") or {})
+    d = {"mode": cfg["mode"], "agents": sorted(cfg["bots"]), "shadow_lines": n, "held": held}
+    print(json.dumps(d) if as_json else f"{d['mode']}: {', '.join(d['agents']) or 'no agents'}; {n} shadow lines; "
+          f"{held} held")
     return 0
 
 
