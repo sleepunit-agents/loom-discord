@@ -4,7 +4,8 @@
     loom-discord run                         the poller (the piece's service): shadow or live, by DISCORD_MODE
     loom-discord send --place P --agent A    the venue's `send` (the runtime runs it): the text on stdin, posted as
                                              that agent's own bot; answers {ok, id?} or {ok: false, reason,
-                                             permanent?} (permanent: no retry will ever post it)
+                                             permanent?, shadow?} (permanent: no retry will ever post it;
+                                             shadow: refused only because this adapter is in shadow)
         … --describe                         the place's rules, for a body's start: {ok, guest, peer, venue,
                                              readers, notes, pair?} (posts nothing; shadow too)
         … --status working|done [--message ID]...   a body at work there (the runtime's word): the run loop shows
@@ -189,7 +190,9 @@ def send(cfg, argv, stdin=None, secrets=None, api_for=None):
         msgs = [argv[j + 1] for j, x in enumerate(argv) if x == "--message" and j + 1 < len(argv)]
         return answer(common.Presence(cfg["data"]).status(agent, place, state, msgs))
     if cfg["mode"] != "live":
-        return never("loom-discord is in shadow mode: it posts nothing")
+        # `shadow: true`: the runtime hands a DM it refused this way to the old bridge, which posts there until this
+        # adapter is live (loom-box delivery.mjs LEGACY_SEND, t-1920); any other refusal for good stays refused.
+        return answer({"ok": False, "reason": "loom-discord is in shadow mode: it posts nothing", "permanent": True, "shadow": True})
     kind, _, cid = place.partition(":")
     if kind not in ("channel", "thread") or not cid.isdigit():
         return never(f"not a Discord place: {place[:80]}")
