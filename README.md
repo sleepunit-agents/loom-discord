@@ -135,9 +135,20 @@ agent there, stops the agent's body in that place when one is working there or i
 The runtime hears it on its next `--status` (`{ok: true, stop: true}`) and ends the body; live, one line says so. In a
 peer venue, peer turns then wait until a person says something else.
 
+## Read: a channel for a piece with no body
+
+`loom-discord read --place <place> --agent <agent> [--after <id>] [--limit <n>]` reads a place as that agent's bot and
+prints `{ok, messages: [{id, at, from, person, may_wake, text}]}`, oldest first: up to `--limit` (100 at most) after
+`--after`, or without it the latest one (a reader's first sight). It routes, delivers and posts nothing, in shadow
+too, so a channel the route map `ignore`s can be read. `person` is a person's post (not a bot, a webhook or this bot);
+`may_wake` is whether the agent's gates let that person wake it there, the gate a delivery passes. Gates or route map
+unreadable: `{ok: false}`. It's for a piece that acts on a channel by itself: the packages piece reads the packages
+channel this way and registers the tracking numbers posted there (shuttle's extension tick, t-1965). It reads
+through `loom discord read …`, so the token stays in this piece.
+
 ## Not here (yet)
 
-The peer-turn budget, and the extension tick (the packages channel). `render` isn't declared: loom's generic render
+The peer-turn budget. `render` isn't declared: loom's generic render
 shows these conversations.
 
 ## Tests
