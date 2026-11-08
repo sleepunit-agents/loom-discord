@@ -10,6 +10,10 @@
                                              readers, notes, pair?} (posts nothing; shadow too)
         … --status working|done [--message ID]...   a body at work there (the runtime's word): the run loop shows
                                              it (typing, 👀); answers {ok, stop?} (stop: a person said the stop word)
+    loom-discord read --place P --agent A [--after ID] [--limit N]
+                                             a place's messages, read as that agent's bot, for a piece that acts on a
+                                             channel without a body (the packages channel): {ok, messages: [{id, at,
+                                             from, person, may_wake, text}]}, oldest first; posts nothing, shadow too
     loom-discord compare --start T --adapter GLOB --bridge GLOB [--hours 24] [--json]
                                              the shadow window: this adapter's log against the old bridge's
     loom-discord status [--json]             the mode, the agents, the log's size, how many are held (no ids, no text)
@@ -236,6 +240,70 @@ def describe(cfg, agent, place, docs=None):
     return routing.View(agent, routes, gates).describe(chan)
 
 
+READ_MAX = 100
+
+
+def read(cfg, argv, secrets=None, api_for=None, docs=None):
+    """{ok, messages} | {ok: false, reason}: a place's messages as the agent's own bot sees them, for a piece that acts
+    on a channel by itself, with no body (the packages piece's tracking numbers; shuttle's extension tick, t-1965).
+    It reads; it routes, delivers and posts nothing, so the route map's `ignore` doesn't apply. With `--after`, up to
+    `--limit` messages after that id; without, the latest `--limit` (1 by default, a reader's first sight). Oldest
+    first. Each says whether its author is a person (not a bot, a webhook or this bot) and whether the agent's gates
+    let them wake it there (`may_wake`: the same gate a delivery passes), so the reader acts only for whom a body would
+    have; the gates or route map unreadable is {ok: false} (fail closed)."""
+    def arg(name, default=None):
+        return argv[argv.index(name) + 1] if name in argv and argv.index(name) + 1 < len(argv) else default
+    place, agent, after = arg("--place"), arg("--agent"), arg("--after")
+    if not place or not agent:
+        return {"ok": False, "reason": "usage: loom-discord read --place <place> --agent <agent> [--after ID] [--limit N]"}
+    kind, _, cid = place.partition(":")
+    if kind not in ("channel", "thread") or not cid.isdigit():
+        return {"ok": False, "reason": f"not a Discord place: {place[:80]}"}
+    if after is not None and not after.isdigit():
+        return {"ok": False, "reason": "--after is a message id"}
+    try:
+        limit = int(arg("--limit", "1" if after is None else str(READ_MAX)))
+    except ValueError:
+        return {"ok": False, "reason": "--limit is a number"}
+    if not 1 <= limit <= READ_MAX:
+        return {"ok": False, "reason": f"--limit is 1 to {READ_MAX}"}
+    name = cfg["bots"].get(agent)
+    if not name:
+        return {"ok": False, "reason": f"no Discord bot for {agent}"}
+    r, g = docs or (common.Doc(common.fill(cfg["routes"], agent=agent), what=f"{agent}'s route map"),
+                    common.Doc(common.fill(cfg["gates"], agent=agent), what=f"{agent}'s gates"))
+    routes, gates = r.doc(), g.doc()
+    if routes is None or gates is None:
+        return {"ok": False, "reason": f"{agent}'s route map or gates can't be read"}
+    view = routing.View(agent, routes, gates)
+    if not view.bot:
+        return {"ok": False, "reason": f"no bot id for {agent} in its route map"}
+    try:
+        token = (secrets or common.Secrets(cfg["may"], cfg["get"])).get(agent, name)
+    except common.SecretRefused as e:
+        return {"ok": False, "reason": f"{agent}'s bot: {e}"}
+    api = (api_for or adapter.Discord)(token)
+    query = f"after={after}&limit={limit}" if after is not None else f"limit={limit}"
+    try:
+        msgs = api.call(f"/channels/{cid}/messages?{query}") or []
+    except Exception as e:  # noqa: BLE001 - the caller gets a reason, never a trace
+        return {"ok": False, "reason": f"Discord refused the read: {type(e).__name__} {getattr(e, 'code', '')}".strip()}
+    if kind == "thread":
+        parents = (common.load_json(Path(cfg["data"]) / "state.json", {}) or {}).get("parents") or {}
+        chan = routing.chan_of(place, parents) or {"id": cid}
+    else:
+        chan = {"id": cid}
+    out = []
+    for m in sorted(msgs, key=lambda m: int(m["id"])):
+        author = m.get("author") or {}
+        person = (not author.get("bot") and str(author.get("id")) != view.bot and m.get("webhook_id") is None
+                  and m.get("type") in (0, 19))
+        out.append({"id": str(m["id"]), "at": adapter.message_iso(m), "from": common.from_of(view.sender(m)),
+                    "person": person, "may_wake": person and view.human_allowed(author.get("id"), routing.venue_of(chan)),
+                    "text": routing.text_of(m)})
+    return {"ok": True, "messages": out}
+
+
 def status(cfg, as_json):
     p = Path(cfg["data"]) / common.ShadowLog.NAME
     try:
@@ -252,7 +320,7 @@ def status(cfg, as_json):
 
 def main(argv):
     verb = argv[0] if argv else ""
-    if verb in ("send", "run", "status") and not under_loom():
+    if verb in ("send", "run", "status", "read") and not under_loom():
         reexec_under_loom(argv)
     if verb == "compare":
         return common.compare_main(argv[1:], "discord")
@@ -269,6 +337,10 @@ def main(argv):
         return send(cfg, argv[1:])
     if verb == "status":
         return status(cfg, "--json" in argv)
+    if verb == "read":
+        ans = read(cfg, argv[1:])
+        print(json.dumps(ans))
+        return 0 if ans.get("ok") else 1
     sys.stderr.write(__doc__)
     return 2
 
